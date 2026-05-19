@@ -497,6 +497,63 @@ defmodule ReqLLM.TelemetryTest do
     assert event_count(events, [:req_llm, :request, :exception]) == 0
   end
 
+  test "captures spec request options into request_options metadata on start" do
+    model = %LLMDB.Model{provider: :openai, id: "gpt-5"}
+
+    opts = [
+      temperature: 0.6,
+      top_p: 0.9,
+      max_tokens: 128,
+      stop: ["END", "STOP"],
+      seed: 7,
+      telemetry: [conversation_id: "session-xyz"]
+    ]
+
+    fake_request = %Req.Request{url: URI.parse("https://api.openai.com:443/v1/chat/completions")}
+
+    model
+    |> ReqLLM.Telemetry.new_context(opts, operation: :chat)
+    |> ReqLLM.Telemetry.start_request(fake_request)
+
+    assert_receive {:telemetry_event, [:req_llm, :request, :start], _measurements, metadata}
+
+    assert %{
+             temperature: 0.6,
+             top_p: 0.9,
+             max_tokens: 128,
+             stop_sequences: ["END", "STOP"],
+             seed: 7,
+             stream?: false,
+             conversation_id: "session-xyz"
+           } = metadata.request_options
+
+    assert metadata.server == %{
+             address: "api.openai.com",
+             port: 443,
+             path: "/v1/chat/completions"
+           }
+  end
+
+  test "captures service_tier into request_options for OpenAI extension attributes" do
+    model = %LLMDB.Model{provider: :openai, id: "gpt-5"}
+
+    opts = [
+      service_tier: "priority",
+      temperature: 0.5
+    ]
+
+    fake_request = %Req.Request{url: URI.parse("https://api.openai.com/v1/responses")}
+
+    model
+    |> ReqLLM.Telemetry.new_context(opts, operation: :chat)
+    |> ReqLLM.Telemetry.start_request(fake_request)
+
+    assert_receive {:telemetry_event, [:req_llm, :request, :start], _measurements, metadata}
+
+    assert metadata.request_options[:service_tier] == "priority"
+    assert metadata.server[:path] == "/v1/responses"
+  end
+
   defp reasoning_model(provider, id) do
     %LLMDB.Model{
       provider: provider,
@@ -580,4 +637,60 @@ defmodule ReqLLM.TelemetryTest do
 
   defp restore_app_env(app, key, nil), do: Application.delete_env(app, key)
   defp restore_app_env(app, key, value), do: Application.put_env(app, key, value)
+
+  describe "observe_stream_chunk/2 first-chunk timing" do
+    defp streaming_context do
+      ReqLLM.Telemetry.new_context(
+        %LLMDB.Model{id: "gpt-5", provider: :openai},
+        [],
+        operation: :chat,
+        mode: :stream
+      )
+      |> Map.put(:started_at, System.monotonic_time())
+    end
+
+    test "stamps first_chunk_at on the first non-empty content chunk" do
+      context =
+        streaming_context()
+        |> ReqLLM.Telemetry.observe_stream_chunk(ReqLLM.StreamChunk.text("Hi"))
+
+      assert is_integer(context.first_chunk_at)
+    end
+
+    test "stamps first_chunk_at on the first tool_call chunk (tool-only responses)" do
+      context =
+        streaming_context()
+        |> ReqLLM.Telemetry.observe_stream_chunk(
+          ReqLLM.StreamChunk.tool_call("get_weather", %{"city" => "Berlin"}, %{id: "call_1"})
+        )
+
+      assert is_integer(context.first_chunk_at)
+    end
+
+    test "does not stamp on empty content chunks" do
+      context =
+        streaming_context()
+        |> ReqLLM.Telemetry.observe_stream_chunk(ReqLLM.StreamChunk.text(""))
+
+      assert context.first_chunk_at == nil
+    end
+
+    test "does not stamp on thinking or meta chunks" do
+      context =
+        streaming_context()
+        |> ReqLLM.Telemetry.observe_stream_chunk(ReqLLM.StreamChunk.thinking("reasoning"))
+        |> ReqLLM.Telemetry.observe_stream_chunk(ReqLLM.StreamChunk.meta(%{usage: %{output: 1}}))
+
+      assert context.first_chunk_at == nil
+    end
+
+    test "does not overwrite first_chunk_at on subsequent chunks" do
+      context = streaming_context()
+      context = ReqLLM.Telemetry.observe_stream_chunk(context, ReqLLM.StreamChunk.text("first"))
+      first = context.first_chunk_at
+
+      context = ReqLLM.Telemetry.observe_stream_chunk(context, ReqLLM.StreamChunk.text("second"))
+      assert context.first_chunk_at == first
+    end
+  end
 end

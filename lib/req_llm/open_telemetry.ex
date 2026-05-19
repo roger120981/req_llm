@@ -1,5 +1,55 @@
 defmodule ReqLLM.OpenTelemetry.Adapter do
-  @moduledoc false
+  @moduledoc """
+  Behaviour the OpenTelemetry bridge uses to talk to a tracer.
+
+  `ReqLLM.OpenTelemetry` ships `ReqLLM.OpenTelemetry.OTelAdapter` as the
+  default implementation, which calls the standard `:otel_tracer` and
+  `:otel_span` API. Implement this behaviour to swap in a different tracer,
+  inject extra attributes on every span (e.g. caller-context like
+  `langfuse.user.id`), or run the bridge in test mode without an OpenTelemetry
+  SDK.
+
+  Pass your module via `:adapter`:
+
+      ReqLLM.OpenTelemetry.attach("req-llm-otel", adapter: MyApp.ReqLLMAdapter)
+
+  ## Required callbacks
+
+  `available?/0`, `start_span/3`, `set_attributes/3`, `add_event/4`,
+  `set_status/4`, `end_span/2`.
+
+  ## Optional callbacks (metrics)
+
+  `metrics_available?/0`, `record_histogram/2`. The bridge only invokes
+  these when both `available?/0` and `metrics_available?/0` return `true`.
+
+  ## Example — inject caller-context on every ReqLLM span
+
+  The cleanest way to wrap the default adapter is to delegate everything and
+  override just `start_span/3` to merge in extra attributes:
+
+      defmodule MyApp.ReqLLMAdapter do
+        @behaviour ReqLLM.OpenTelemetry.Adapter
+
+        defdelegate available?(), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate metrics_available?(), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate set_attributes(s, a, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate add_event(s, n, a, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate set_status(s, k, m, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate end_span(s, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate record_histogram(r, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+
+        def start_span(name, attrs, config) do
+          extras = %{"langfuse.user.id" => Process.get(:current_user_id)}
+          ReqLLM.OpenTelemetry.OTelAdapter.start_span(name, Map.merge(attrs, extras), config)
+        end
+      end
+
+      ReqLLM.OpenTelemetry.attach("req-llm-otel", adapter: MyApp.ReqLLMAdapter)
+
+  See the Telemetry guide's caller-context section for when to use this
+  versus a parent span or OTel baggage.
+  """
 
   @callback available?() :: boolean()
   @callback start_span(String.t(), map(), keyword()) :: term()
@@ -7,12 +57,26 @@ defmodule ReqLLM.OpenTelemetry.Adapter do
   @callback add_event(term(), atom() | String.t(), map(), keyword()) :: :ok
   @callback set_status(term(), :ok | :error, String.t() | nil, keyword()) :: :ok
   @callback end_span(term(), keyword()) :: :ok
+  @callback metrics_available?() :: boolean()
+  @callback record_histogram(map(), keyword()) :: :ok
+
+  @optional_callbacks metrics_available?: 0, record_histogram: 2
 end
 
 defmodule ReqLLM.OpenTelemetry.OTelAdapter do
-  @moduledoc false
+  @moduledoc """
+  Default `ReqLLM.OpenTelemetry.Adapter` implementation, backed by the
+  Erlang OpenTelemetry SDK (`:otel_tracer`, `:otel_span`, `:otel_meter`).
+
+  Used automatically by `ReqLLM.OpenTelemetry.attach/2`. Public so that
+  custom adapters can `defdelegate` the callbacks they don't need to
+  override — see `ReqLLM.OpenTelemetry.Adapter` for the wrapping pattern.
+  """
 
   @behaviour ReqLLM.OpenTelemetry.Adapter
+
+  @instrument_table :req_llm_open_telemetry_instruments
+  @otel_schema_url "https://opentelemetry.io/schemas/1.37.0"
 
   @impl true
   def available? do
@@ -25,6 +89,21 @@ defmodule ReqLLM.OpenTelemetry.OTelAdapter do
         {:otel_span, :set_status, 2},
         {:otel_span, :set_status, 3},
         {:otel_span, :end_span, 1}
+      ],
+      fn {module, function, arity} ->
+        Code.ensure_loaded?(module) and function_exported?(module, function, arity)
+      end
+    )
+  end
+
+  @impl true
+  def metrics_available? do
+    Enum.all?(
+      [
+        {:otel_meter_provider, :get_meter, 3},
+        {:otel_meter, :create_histogram, 3},
+        {:otel_histogram, :record, 4},
+        {:otel_ctx, :get_current, 0}
       ],
       fn {module, function, arity} ->
         Code.ensure_loaded?(module) and function_exported?(module, function, arity)
@@ -76,6 +155,106 @@ defmodule ReqLLM.OpenTelemetry.OTelAdapter do
     :ok
   end
 
+  @impl true
+  def record_histogram(record, _config) do
+    instrument = ensure_instrument(record)
+    ctx = call(:otel_ctx, :get_current, [])
+
+    call(:otel_histogram, :record, [
+      ctx,
+      instrument,
+      record.value,
+      atomize_keys(record.attributes)
+    ])
+
+    :ok
+  end
+
+  defp ensure_instrument(%{name: name} = record) do
+    ensure_instrument_table()
+    instrument_name = otel_instrument_name(name)
+
+    case :ets.lookup(@instrument_table, instrument_name) do
+      [{^instrument_name, instrument}] ->
+        instrument
+
+      [] ->
+        instrument =
+          call(:otel_meter, :create_histogram, [
+            meter(),
+            instrument_name,
+            instrument_config(record)
+          ])
+
+        if :ets.insert_new(@instrument_table, {instrument_name, instrument}) do
+          instrument
+        else
+          [{^instrument_name, existing}] = :ets.lookup(@instrument_table, instrument_name)
+          existing
+        end
+    end
+  end
+
+  defp ensure_instrument_table do
+    case :ets.whereis(@instrument_table) do
+      :undefined ->
+        :ets.new(@instrument_table, [
+          :named_table,
+          :public,
+          :set,
+          {:read_concurrency, true},
+          {:write_concurrency, true}
+        ])
+
+      _ ->
+        @instrument_table
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp instrument_config(record) do
+    base = %{
+      description: Map.get(record, :description, ""),
+      unit: Map.get(record, :unit, "")
+    }
+
+    case Map.get(record, :boundaries, []) do
+      [] ->
+        base
+
+      [_ | _] = boundaries ->
+        Map.put(base, :advisory_params, %{explicit_bucket_boundaries: boundaries})
+    end
+  end
+
+  defp otel_instrument_name(name) when is_atom(name), do: name
+  defp otel_instrument_name(name), do: String.to_atom(name)
+
+  # Keys come from the closed `gen_ai.*` / `server.*` / `error.*` set defined in
+  # `ReqLLM.OpenTelemetry.{Attributes,Content,Metrics}` — not from caller-supplied
+  # input — so `String.to_atom/1` is safe here. Do not pass user-supplied keys through.
+  defp atomize_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {key, value} when is_atom(key) -> {key, value}
+      {key, value} when is_binary(key) -> {String.to_atom(key), value}
+    end)
+  end
+
+  defp meter do
+    call(
+      :otel_meter_provider,
+      :get_meter,
+      [
+        :req_llm,
+        application_version(),
+        @otel_schema_url
+      ]
+    )
+  end
+
   defp tracer do
     call(
       :otel_tracer_provider,
@@ -83,7 +262,7 @@ defmodule ReqLLM.OpenTelemetry.OTelAdapter do
       [
         :req_llm,
         application_version(),
-        "https://opentelemetry.io/schemas/1.37.0"
+        @otel_schema_url
       ]
     )
   end
@@ -125,6 +304,10 @@ defmodule ReqLLM.OpenTelemetry do
   `ReqLLM.Telemetry.OpenTelemetry`.
   """
 
+  alias ReqLLM.MapAccess
+  alias ReqLLM.OpenTelemetry.{Attributes, SemConv, Translator}
+  alias ReqLLM.Telemetry.OpenTelemetry, as: Mapper
+
   @events [
     [:req_llm, :request, :start],
     [:req_llm, :request, :stop],
@@ -133,28 +316,15 @@ defmodule ReqLLM.OpenTelemetry do
   @default_handler_id "req-llm-open-telemetry"
   @span_table :req_llm_open_telemetry_spans
   @default_adapter ReqLLM.OpenTelemetry.OTelAdapter
-  @provider_names %{
-    amazon_bedrock: "aws.bedrock",
-    anthropic: "anthropic",
-    google: "gcp.gen_ai",
-    google_vertex: "gcp.vertex_ai",
-    openai: "openai"
-  }
-  @output_types %{
-    chat: "text",
-    object: "json",
-    image: "image",
-    speech: "audio",
-    transcription: "text"
-  }
-  @operation_names %{
-    chat: "chat",
-    embedding: "embeddings",
-    image: "generate_content",
-    object: "chat"
-  }
 
-  @type attach_opt :: {:adapter, module()} | {:handler_id, term()} | {atom(), term()}
+  @type content_mode :: :none | :attributes | :event
+
+  @type attach_opt ::
+          {:adapter, module()}
+          | {:handler_id, term()}
+          | {:content, content_mode() | boolean()}
+          | {:langfuse, boolean()}
+          | {atom(), term()}
 
   @doc """
   Returns the request lifecycle events used by the bridge.
@@ -172,6 +342,29 @@ defmodule ReqLLM.OpenTelemetry do
 
   @doc """
   Attaches the OpenTelemetry bridge to ReqLLM request lifecycle events.
+
+  Options:
+
+  - `:adapter` — alternate adapter module (defaults to
+    `ReqLLM.OpenTelemetry.OTelAdapter`).
+  - `:content` — content capture mode. `:none` (default) emits no message
+    payloads; `:attributes` promotes `gen_ai.input.messages`,
+    `gen_ai.system_instructions`, `gen_ai.tool.definitions`, and
+    `gen_ai.output.messages` onto the span; `:event` emits the same payload
+    as a single `gen_ai.client.inference.operation.details` span event on
+    the terminal lifecycle event. `true` is accepted as an alias for
+    `:attributes`.
+  - `:langfuse` — when `true`, also adds `langfuse.observation.cost_details`
+    (JSON-encoded breakdown) when ReqLLM has computed a cost.
+
+  Content capture additionally requires `telemetry: [payloads: :raw]` on the
+  call so the request/response payloads are available to map.
+
+  In-flight spans are tracked in a named ETS table keyed by handler id and
+  request id. If a `:start` event is observed but no `:stop`/`:exception`
+  follows (e.g. the calling process crashed before emission), the entry stays
+  in the table until `detach/1` runs. Long-running hosts can call
+  `prune_stale_spans/2` periodically to clear out entries older than a TTL.
   """
   @spec attach(term(), keyword()) :: :ok | {:error, :already_exists | :opentelemetry_unavailable}
   def attach(handler_id \\ @default_handler_id, opts \\ []) do
@@ -195,8 +388,34 @@ defmodule ReqLLM.OpenTelemetry do
   @spec detach(term()) :: :ok
   def detach(handler_id \\ @default_handler_id) do
     ensure_span_table()
-    :ets.match_delete(@span_table, {{handler_id, :_}, :_})
+    :ets.match_delete(@span_table, {{handler_id, :_}, :_, :_})
     :telemetry.detach(handler_id)
+  end
+
+  @doc """
+  Removes in-flight span entries older than `ttl_ms` for `handler_id`.
+
+  Returns the number of entries pruned. Use this from a host-side scheduler
+  (e.g. an `:erlang.send_after/3` loop or a periodic GenServer tick) to
+  contain the ETS table when requests start without a matching stop or
+  exception event.
+  """
+  @spec prune_stale_spans(term(), non_neg_integer()) :: non_neg_integer()
+  def prune_stale_spans(handler_id \\ @default_handler_id, ttl_ms)
+      when is_integer(ttl_ms) and ttl_ms >= 0 do
+    ensure_span_table()
+    cutoff_ms = System.monotonic_time(:millisecond) - ttl_ms
+
+    @span_table
+    |> :ets.match_object({{handler_id, :_}, :_, :_})
+    |> Enum.reduce(0, fn {key, _span, inserted_at_ms}, acc ->
+      if inserted_at_ms <= cutoff_ms do
+        :ets.delete(@span_table, key)
+        acc + 1
+      else
+        acc
+      end
+    end)
   end
 
   @doc """
@@ -204,7 +423,10 @@ defmodule ReqLLM.OpenTelemetry do
   """
   @spec span_name(map()) :: String.t()
   def span_name(metadata) do
-    "#{operation_name(metadata)} #{request_model(metadata) || "unknown"}"
+    SemConv.span_name(
+      MapAccess.get(metadata, :operation),
+      Attributes.request_model(metadata) || "unknown"
+    )
   end
 
   @doc false
@@ -212,43 +434,59 @@ defmodule ReqLLM.OpenTelemetry do
   def handle_event([:req_llm, :request, :start], _measurements, metadata, config) do
     ensure_span_table()
 
-    if request_id = metadata[:request_id] do
-      span = adapter(config).start_span(span_name(metadata), start_attributes(metadata), config)
-      :ets.insert(@span_table, {span_key(config, request_id), span})
+    if request_id = MapAccess.get(metadata, :request_id) do
+      stub = Mapper.request_start(metadata, config)
+      span = Translator.apply_start(stub, adapter(config), config)
+
+      :ets.insert(
+        @span_table,
+        {span_key(config, request_id), span, System.monotonic_time(:millisecond)}
+      )
     end
 
     :ok
   end
 
-  def handle_event([:req_llm, :request, :stop], _measurements, metadata, config) do
-    with request_id when is_binary(request_id) <- metadata[:request_id],
+  def handle_event([:req_llm, :request, :stop], measurements, metadata, config) do
+    with request_id when is_binary(request_id) <- MapAccess.get(metadata, :request_id),
          {:ok, span} <- take_span(config, request_id) do
-      adapter(config).set_attributes(span, stop_attributes(metadata), config)
-      adapter(config).end_span(span, config)
+      stub = Mapper.request_stop(metadata, terminal_opts(config, measurements))
+      Translator.apply_terminal(span, stub, adapter(config), config)
     end
 
     :ok
   end
 
-  def handle_event([:req_llm, :request, :exception], _measurements, metadata, config) do
-    with request_id when is_binary(request_id) <- metadata[:request_id],
+  def handle_event([:req_llm, :request, :exception], measurements, metadata, config) do
+    with request_id when is_binary(request_id) <- MapAccess.get(metadata, :request_id),
          {:ok, span} <- take_span(config, request_id) do
-      adapter(config).set_attributes(span, exception_attributes(metadata), config)
-      adapter(config).add_event(span, :exception, exception_event_attributes(metadata), config)
-      adapter(config).set_status(span, :error, error_message(metadata[:error]), config)
-      adapter(config).end_span(span, config)
+      stub = Mapper.request_exception(metadata, terminal_opts(config, measurements))
+      Translator.apply_terminal(span, stub, adapter(config), config)
     end
 
     :ok
   end
 
   defp config(handler_id, opts) do
+    adapter = Keyword.get(opts, :adapter, @default_adapter)
+
     opts
-    |> Keyword.put_new(:adapter, @default_adapter)
+    |> Keyword.put(:adapter, adapter)
     |> Keyword.put(:handler_id, handler_id)
+    |> Keyword.put(:metrics_enabled?, metrics_enabled?(adapter))
   end
 
   defp adapter(opts), do: Keyword.get(opts, :adapter, @default_adapter)
+
+  defp metrics_enabled?(adapter) do
+    function_exported?(adapter, :metrics_available?, 0) and
+      function_exported?(adapter, :record_histogram, 2) and
+      adapter.metrics_available?()
+  end
+
+  defp terminal_opts(config, measurements) do
+    Keyword.put(config, :measurements, measurements || %{})
+  end
 
   defp ensure_span_table do
     case :ets.whereis(@span_table) do
@@ -278,102 +516,12 @@ defmodule ReqLLM.OpenTelemetry do
     key = span_key(config, request_id)
 
     case :ets.lookup(@span_table, key) do
-      [{^key, span}] ->
+      [{^key, span, _inserted_at}] ->
         :ets.delete(@span_table, key)
         {:ok, span}
 
       [] ->
         :error
     end
-  end
-
-  defp start_attributes(metadata) do
-    %{
-      :"gen_ai.provider.name" => provider_name(metadata[:provider]),
-      :"gen_ai.operation.name" => operation_name(metadata),
-      :"gen_ai.request.model" => request_model(metadata),
-      :"gen_ai.output.type" => output_type(metadata[:operation]),
-      :"req_llm.request_id" => metadata[:request_id]
-    }
-    |> compact_attributes()
-  end
-
-  defp stop_attributes(metadata) do
-    usage = usage_tokens(metadata[:usage])
-
-    %{
-      :"gen_ai.response.finish_reasons" => finish_reasons(metadata[:finish_reason]),
-      :"gen_ai.usage.input_tokens" => usage_value(usage, :input),
-      :"gen_ai.usage.output_tokens" => usage_value(usage, :output),
-      :"gen_ai.usage.cache_read.input_tokens" => usage_value(usage, :cached_input),
-      :"gen_ai.usage.cache_creation.input_tokens" => usage_value(usage, :cache_creation)
-    }
-    |> compact_attributes()
-  end
-
-  defp exception_attributes(metadata) do
-    %{
-      :"error.type" => error_type(metadata),
-      :"req_llm.request_id" => metadata[:request_id]
-    }
-    |> compact_attributes()
-  end
-
-  defp exception_event_attributes(metadata) do
-    %{
-      :"exception.type" => error_type(metadata),
-      :"exception.message" => error_message(metadata[:error])
-    }
-    |> compact_attributes()
-  end
-
-  defp provider_name(provider) when is_atom(provider) do
-    Map.get(@provider_names, provider, Atom.to_string(provider))
-  end
-
-  defp provider_name(provider) when is_binary(provider), do: provider
-  defp provider_name(_), do: nil
-
-  defp operation_name(metadata) do
-    metadata
-    |> Map.get(:operation)
-    |> then(&Map.get(@operation_names, &1, to_string(&1 || "chat")))
-  end
-
-  defp output_type(operation), do: Map.get(@output_types, operation)
-
-  defp request_model(%{model: %LLMDB.Model{id: id}}), do: id
-
-  defp request_model(%{model: model}) when is_map(model),
-    do: Map.get(model, :id)
-
-  defp request_model(_), do: nil
-
-  defp finish_reasons(nil), do: nil
-  defp finish_reasons(reason), do: [to_string(reason)]
-
-  defp usage_tokens(%{tokens: tokens}) when is_map(tokens), do: tokens
-  defp usage_tokens(tokens) when is_map(tokens), do: tokens
-  defp usage_tokens(_), do: %{}
-
-  defp usage_value(usage, key) when is_map(usage) do
-    usage[key] || usage[Atom.to_string(key)]
-  end
-
-  defp error_type(%{http_status: status}) when is_integer(status), do: Integer.to_string(status)
-
-  defp error_type(%{error: %{__struct__: module}}), do: inspect(module)
-  defp error_type(%{error: error}) when is_atom(error), do: Atom.to_string(error)
-  defp error_type(%{error: {kind, _reason}}) when is_atom(kind), do: Atom.to_string(kind)
-  defp error_type(_), do: "_OTHER"
-
-  defp error_message(nil), do: nil
-  defp error_message(%{__struct__: _} = error), do: Exception.message(error)
-  defp error_message(error), do: inspect(error)
-
-  defp compact_attributes(attributes) do
-    attributes
-    |> Enum.reject(fn {_key, value} -> is_nil(value) or value == [] end)
-    |> Map.new()
   end
 end

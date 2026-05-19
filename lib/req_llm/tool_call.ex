@@ -76,6 +76,81 @@ defmodule ReqLLM.ToolCall do
     }
   end
 
+  @doc """
+  Create a ToolCall representing a server-side builtin invocation that the
+  provider executed on the model's behalf (e.g. OpenAI Responses API
+  `web_search_call`, `file_search_call`).
+
+  These calls are exposed in `message.tool_calls` for inspection and
+  observability — the OTel GenAI bridge surfaces them as `tool_call` parts
+  in `gen_ai.output.messages`. They are **not replayable**: the provider
+  already executed them, and the OpenAI Responses request schema rejects
+  them in `input`. Request encoders, `finish_reason` derivation, and tool
+  call ID sanitisers must skip entries where `builtin?(tc)` is true.
+
+  `arguments_json` should be a JSON-encoded string capturing whatever
+  per-call payload the provider returned (action, query, result URLs, etc.).
+  """
+  @spec new_builtin(String.t() | nil, String.t(), String.t()) :: t()
+  def new_builtin(id, name, arguments_json) do
+    %__MODULE__{
+      id: id || generate_id(),
+      type: "function",
+      function: %{
+        name: name,
+        arguments: arguments_json,
+        builtin?: true
+      }
+    }
+  end
+
+  @doc """
+  Returns true when the ToolCall (or tool-call-shaped map) represents a
+  server-side builtin invocation. Handles both OpenAI-shaped wrappers and
+  bare maps: unwraps a nested `:function` map when present.
+
+  Prefer this over `flagged_builtin?/1` whenever you have a `%ToolCall{}`
+  or a map that may carry the OpenAI `function:` nesting.
+  """
+  @spec builtin?(t() | map()) :: boolean()
+  def builtin?(%__MODULE__{function: function}) when is_map(function),
+    do: flagged_builtin?(function)
+
+  def builtin?(map) when is_map(map) do
+    function = Map.get(map, :function) || Map.get(map, "function") || %{}
+    flagged_builtin?(map) or flagged_builtin?(function)
+  end
+
+  def builtin?(_), do: false
+
+  @doc """
+  Returns true when the given map carries a truthy `:builtin?` (or
+  `"builtin?"`) flag **directly on it**. Does not unwrap a nested
+  `:function` map — use it for chunk metadata or raw tool-call shapes
+  that don't have the OpenAI `function` nesting.
+
+  For structured `%ToolCall{}` or OpenAI-wrapped maps, prefer `builtin?/1`.
+  """
+  @spec flagged_builtin?(any()) :: boolean()
+  def flagged_builtin?(map) when is_map(map) do
+    Map.get(map, :builtin?) == true or Map.get(map, "builtin?") == true
+  end
+
+  def flagged_builtin?(_), do: false
+
+  @deprecated "Use flagged_builtin?/1 instead — the rename makes the flag-only semantics explicit"
+  @spec builtin_flag?(any()) :: boolean()
+  def builtin_flag?(map), do: flagged_builtin?(map)
+
+  @doc """
+  Sets `:builtin? => true` on `map` when `flag` is `true`; otherwise returns
+  `map` unchanged. Used by stream/response builders that propagate the
+  builtin marker onto plain tool-call maps before they reach `new_builtin/3`.
+  """
+  @spec put_builtin_flag(map(), boolean()) :: map()
+  def put_builtin_flag(map, true), do: Map.put(map, :builtin?, true)
+  def put_builtin_flag(map, _), do: map
+
   defp generate_id do
     "call_#{Uniq.UUID.uuid7()}"
   end
@@ -197,18 +272,32 @@ defmodule ReqLLM.ToolCall do
 
   defimpl Jason.Encoder do
     def encode(%{id: id, type: type, function: function}, opts) do
+      function_map =
+        %{
+          "name" => function.name,
+          "arguments" => function.arguments
+        }
+        |> maybe_put_builtin(function)
+
       Jason.Encode.map(
         %{
           "id" => id,
           "type" => type,
-          "function" => %{
-            "name" => function.name,
-            "arguments" => function.arguments
-          }
+          "function" => function_map
         },
         opts
       )
     end
+
+    defp maybe_put_builtin(map, function) when is_map(function) do
+      if Map.get(function, :builtin?) == true or Map.get(function, "builtin?") == true do
+        Map.put(map, "builtin?", true)
+      else
+        map
+      end
+    end
+
+    defp maybe_put_builtin(map, _function), do: map
   end
 
   defimpl Inspect do

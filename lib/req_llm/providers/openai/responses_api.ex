@@ -260,8 +260,46 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       end
 
     meta = Map.merge(meta, extract_assistant_phase_metadata(response_output))
+    meta = merge_response_provider_meta(meta, data["response"] || %{})
 
     [ReqLLM.StreamChunk.meta(meta)]
+  end
+
+  # Mirrors the drop-list used by the non-streaming response builder (see
+  # `decode_response_body/4` ~line 1546) so streaming and non-streaming
+  # `provider_meta` capture the same set of OpenAI response fields
+  # (service_tier, system_fingerprint, plus anything else OpenAI surfaces).
+  @response_provider_meta_drop ["id", "model", "output_text", "output", "usage"]
+
+  defp merge_response_provider_meta(meta, response) when is_map(response) do
+    # `api_type` is stamped centrally by the OpenAI dispatcher
+    # (`ReqLLM.Providers.OpenAI.decode_response/1`), so this path stays
+    # focused on the response fields we pull out of stream `response.*`
+    # events.
+    extras =
+      response
+      |> Map.drop(@response_provider_meta_drop)
+      |> drop_blanks()
+
+    if map_size(extras) > 0 do
+      case Map.get(meta, :provider_meta) do
+        existing when is_map(existing) ->
+          Map.put(meta, :provider_meta, Map.merge(existing, extras))
+
+        _ ->
+          Map.put(meta, :provider_meta, extras)
+      end
+    else
+      meta
+    end
+  end
+
+  defp merge_response_provider_meta(meta, _), do: meta
+
+  defp drop_blanks(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+    |> Map.new()
   end
 
   defp ensure_stream_state(nil), do: init_stream_state()
@@ -1027,6 +1065,9 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
           []
         end
 
+      type when is_binary(type) ->
+        []
+
       _ ->
         []
     end
@@ -1048,9 +1089,50 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp handle_output_item_done_item(item, data, state) do
     case item["type"] || item[:type] do
-      "function_call" -> handle_function_call_item_done(item, data, state)
-      "message" -> handle_message_item_done(item, data, state)
-      _ -> []
+      "function_call" ->
+        handle_function_call_item_done(item, data, state)
+
+      "message" ->
+        handle_message_item_done(item, data, state)
+
+      type when is_binary(type) ->
+        if Map.has_key?(@tool_call_atom_keys, type),
+          do: handle_builtin_call_item_done(item, data, state, type),
+          else: []
+
+      _ ->
+        []
+    end
+  end
+
+  defp handle_builtin_call_item_done(item, data, state, type) do
+    index = stream_output_index(data)
+
+    if tool_call_emitted?(state, index) do
+      args =
+        item
+        |> Map.drop(["id", "call_id", "type", "status"])
+        |> Jason.encode!()
+
+      [
+        ReqLLM.StreamChunk.meta(%{
+          tool_call_args: %{index: index, fragment: args, builtin?: true}
+        })
+      ]
+    else
+      id = item["id"] || item["call_id"]
+
+      args_map =
+        item
+        |> Map.drop(["id", "call_id", "type", "status"])
+
+      [
+        ReqLLM.StreamChunk.tool_call(
+          type,
+          args_map,
+          %{id: id, index: index, builtin?: true}
+        )
+      ]
     end
   end
 
@@ -1194,7 +1276,9 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp encode_tool_outputs(_), do: []
 
   defp encode_tool_calls_as_function_calls(tool_calls) do
-    Enum.map(tool_calls, fn tc ->
+    tool_calls
+    |> Enum.reject(&ReqLLM.ToolCall.builtin?/1)
+    |> Enum.map(fn tc ->
       %{
         "type" => "function_call",
         "call_id" => tc.id,
@@ -1455,7 +1539,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     usage = normalize_responses_usage(base_usage, body)
 
-    finish_reason = determine_finish_reason(body, tool_calls)
+    finish_reason =
+      determine_finish_reason(body, Enum.reject(tool_calls, &ReqLLM.ToolCall.builtin?/1))
 
     content_parts = build_content_parts(text, thinking)
     message_metadata = build_message_metadata(body["id"], output_segments)
@@ -1470,7 +1555,16 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     {object, object_meta} = maybe_extract_object(req, text, tool_calls) || {nil, %{}}
 
-    base_provider_meta = Map.drop(body, ["id", "model", "output_text", "output", "usage"])
+    # Stamp `api_type` so Azure Responses (which calls this decoder
+    # directly via `Azure.ResponsesAPI.parse_response/3`, bypassing the
+    # OpenAI dispatcher) also surfaces `openai.api.type` on OTel spans.
+    # The dispatcher's `has_api_type?/1` guard prevents double-stamping
+    # when the OpenAI path runs through it.
+    base_provider_meta =
+      body
+      |> Map.drop(["id", "model", "output_text", "output", "usage"])
+      |> Map.put("api_type", "responses")
+
     provider_meta = Map.merge(base_provider_meta, object_meta)
 
     response = %ReqLLM.Response{
@@ -1747,14 +1841,36 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   end
 
   defp extract_tool_calls_from_segments(segments) do
-    segments
-    |> Enum.filter(&(&1["type"] == "function_call"))
-    |> Enum.map(fn seg ->
-      args_json = normalize_arguments_json(seg["arguments"])
-      id = seg["call_id"] || seg["id"]
-      name = seg["name"] || "unknown"
-      ReqLLM.ToolCall.new(id, name, args_json)
+    Enum.flat_map(segments, fn
+      %{"type" => "function_call"} = seg ->
+        [function_call_segment_to_tool_call(seg)]
+
+      %{"type" => type} = seg when is_binary(type) ->
+        if Map.has_key?(@tool_call_atom_keys, type),
+          do: [builtin_call_segment_to_tool_call(seg, type)],
+          else: []
+
+      _ ->
+        []
     end)
+  end
+
+  defp function_call_segment_to_tool_call(seg) do
+    args_json = normalize_arguments_json(seg["arguments"])
+    id = seg["call_id"] || seg["id"]
+    name = seg["name"] || "unknown"
+    ReqLLM.ToolCall.new(id, name, args_json)
+  end
+
+  defp builtin_call_segment_to_tool_call(seg, type) do
+    id = seg["id"] || seg["call_id"]
+
+    args_json =
+      seg
+      |> Map.drop(["id", "call_id", "type", "status"])
+      |> Jason.encode!()
+
+    ReqLLM.ToolCall.new_builtin(id, type, args_json)
   end
 
   defp extract_reasoning_details_from_segments(segments) do

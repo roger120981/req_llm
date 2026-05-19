@@ -1,15 +1,65 @@
 defmodule ReqLLM.Telemetry do
   @moduledoc """
-  Shared telemetry helpers for ReqLLM request lifecycle instrumentation.
+  Native `:telemetry` emitter for ReqLLM request and reasoning lifecycle.
 
-  This module owns:
+  Every event for a logical request shares the same `request_id`, so request
+  lifecycle, reasoning lifecycle, and token usage can be correlated without
+  provider-specific parsing. The OpenTelemetry bridge (`ReqLLM.OpenTelemetry`)
+  is built on top of these events — attach handlers here for billing, tenant
+  attribution, or any integration that should not depend on an OpenTelemetry
+  SDK.
 
-  - request correlation IDs
-  - request lifecycle events
-  - reasoning lifecycle events
-  - summary extraction
-  - payload policy
-  - compatibility emission for `[:req_llm, :token_usage]`
+  ## Event families
+
+  | Event                                | Measurements                   |
+  |--------------------------------------|--------------------------------|
+  | `[:req_llm, :request, :start]`       | `system_time`                  |
+  | `[:req_llm, :request, :stop]`        | `duration`, `system_time`      |
+  | `[:req_llm, :request, :exception]`   | `duration`, `system_time`      |
+  | `[:req_llm, :reasoning, :start]`     | `system_time`                  |
+  | `[:req_llm, :reasoning, :update]`    | `system_time`                  |
+  | `[:req_llm, :reasoning, :stop]`      | `duration`, `system_time`      |
+  | `[:req_llm, :token_usage]`           | token + cost counters          |
+
+  `duration` is in native monotonic time units — convert with
+  `System.convert_time_unit/3` if you want milliseconds.
+
+  ## Request metadata
+
+  All request lifecycle events carry the same metadata map: `request_id`,
+  `operation`, `mode`, `provider`, `model`, `transport`, `reasoning`,
+  `request_summary`, `response_summary`, `http_status`, `finish_reason`,
+  `usage`, `request_options`, `server`, `streaming`. The full shape and a
+  worked example live in the [Telemetry guide](https://hexdocs.pm/req_llm/telemetry.html).
+
+  Reasoning events never include raw thinking text — they are metadata-only
+  even with payload capture enabled.
+
+  ## Payload modes
+
+  Default is metadata-only. Opt into raw payloads globally or per call:
+
+      config :req_llm, telemetry: [payloads: :raw]
+
+      ReqLLM.generate_text(model, prompt, telemetry: [payloads: :raw])
+
+  Raw payloads are still sanitized — reasoning text is redacted, binary parts
+  are summarized by byte size and media type, embeddings report vector counts
+  rather than vectors. Use with care in multi-tenant systems.
+
+  ## Token usage compatibility
+
+  `[:req_llm, :token_usage]` remains available for existing consumers and now
+  fires for streaming as well as non-streaming requests. For new integrations,
+  prefer `[:req_llm, :request, :stop]` — it includes duration, finish reason,
+  summaries, and normalized reasoning metadata alongside usage.
+
+  ## See also
+
+  - [Telemetry guide](https://hexdocs.pm/req_llm/telemetry.html) — full event
+    shapes, reasoning normalization, payload capture, attach examples
+  - `ReqLLM.OpenTelemetry` — the auto-attached GenAI client span bridge
+  - `ReqLLM.Telemetry.OpenTelemetry` — dependency-free OTel mapper
   """
 
   alias ReqLLM.Context
@@ -58,12 +108,15 @@ defmodule ReqLLM.Telemetry do
           payload_mode: payload_mode(),
           reasoning_contract: reasoning_contract(),
           original_opts: keyword(),
+          request_options: map(),
+          server: map(),
           request_summary: map(),
           request_payload: any(),
           request_started?: boolean(),
           request_stopped?: boolean(),
           started_at: integer() | nil,
-          request_measurement: map() | nil,
+          request_started_system_time: integer() | nil,
+          first_chunk_at: integer() | nil,
           requested_reasoning: map(),
           effective_reasoning: map(),
           reasoning_started?: boolean(),
@@ -103,12 +156,15 @@ defmodule ReqLLM.Telemetry do
       payload_mode: payload_mode,
       reasoning_contract: reasoning_contract,
       original_opts: opts,
+      request_options: ReqLLM.Telemetry.RequestOptions.extract(mode, opts),
+      server: %{},
       request_summary: summarize_request(operation, request_input),
       request_payload: request_payload(operation, request_input, payload_mode),
       request_started?: false,
       request_stopped?: false,
       started_at: nil,
-      request_measurement: nil,
+      request_started_system_time: nil,
+      first_chunk_at: nil,
       requested_reasoning: requested_reasoning,
       effective_reasoning: disable_effective_reasoning(requested_reasoning),
       reasoning_started?: false,
@@ -134,7 +190,8 @@ defmodule ReqLLM.Telemetry do
 
   def start_request(context, request_source) do
     now = System.monotonic_time()
-    measurement = %{system_time: System.system_time()}
+    started_system_time = System.system_time()
+    measurement = %{system_time: started_system_time}
 
     reasoning_contract =
       reasoning_contract_for(context.model, context.original_opts, request_source)
@@ -159,10 +216,11 @@ defmodule ReqLLM.Telemetry do
       context
       |> Map.put(:request_started?, true)
       |> Map.put(:started_at, now)
-      |> Map.put(:request_measurement, measurement)
+      |> Map.put(:request_started_system_time, started_system_time)
       |> Map.put(:reasoning_contract, reasoning_contract)
       |> Map.put(:requested_reasoning, requested_reasoning)
       |> Map.put(:effective_reasoning, effective_reasoning)
+      |> merge_server(extract_server(request_source))
 
     :telemetry.execute(
       @request_start_event,
@@ -194,17 +252,50 @@ defmodule ReqLLM.Telemetry do
   end
 
   @doc """
-  Observes a streaming chunk and emits milestone-based reasoning updates.
+  Folds a streaming chunk into the telemetry context and emits milestone
+  reasoning events when applicable.
+
+  Called by ReqLLM's streaming pipeline (`ReqLLM.StreamServer`) for every
+  chunk produced during a streaming request. Returns an updated context
+  with:
+
+  - `first_chunk_at` set to `System.monotonic_time/0` on the first non-empty
+    content chunk or first tool call — this feeds
+    `streaming.time_to_first_chunk` on the request lifecycle metadata and
+    `gen_ai.client.operation.time_to_first_chunk` on the OpenTelemetry
+    bridge.
+  - `response_summary` counters incremented for text bytes, thinking bytes,
+    tool calls, etc.
+  - A `[:req_llm, :reasoning, :update]` event emitted with
+    `milestone: :content_started` the first time a reasoning chunk is
+    observed.
+
+  Hosts integrating against the low-level streaming API (`ReqLLM.Streaming`)
+  do not normally call this directly — ReqLLM threads it through the
+  streaming pipeline. The high-level `stream_text/3` / `stream_object/4`
+  APIs use it transparently.
   """
   @spec observe_stream_chunk(context(), ReqLLM.StreamChunk.t()) :: context()
   def observe_stream_chunk(context, %ReqLLM.StreamChunk{} = chunk) do
-    context =
-      context
-      |> update_response_summary_state(chunk)
-      |> observe_stream_chunk_reasoning(chunk)
-
     context
+    |> maybe_mark_first_chunk(chunk)
+    |> update_response_summary_state(chunk)
+    |> observe_stream_chunk_reasoning(chunk)
   end
+
+  defp maybe_mark_first_chunk(%{first_chunk_at: at} = context, _chunk) when not is_nil(at),
+    do: context
+
+  defp maybe_mark_first_chunk(context, %ReqLLM.StreamChunk{type: :content, text: text})
+       when is_binary(text) and text != "" do
+    %{context | first_chunk_at: System.monotonic_time()}
+  end
+
+  defp maybe_mark_first_chunk(context, %ReqLLM.StreamChunk{type: :tool_call}) do
+    %{context | first_chunk_at: System.monotonic_time()}
+  end
+
+  defp maybe_mark_first_chunk(context, _chunk), do: context
 
   @doc """
   Observes a terminal response and updates response and reasoning state.
@@ -399,6 +490,9 @@ defmodule ReqLLM.Telemetry do
       model: context.model,
       transport: context.transport,
       reasoning: reasoning_snapshot(context),
+      request_options: context.request_options,
+      server: context.server,
+      request_started_system_time: context.request_started_system_time,
       request_summary: context.request_summary,
       response_summary: extra[:response_summary],
       http_status: extra[:http_status],
@@ -407,10 +501,29 @@ defmodule ReqLLM.Telemetry do
     }
 
     base
+    |> maybe_put(:streaming, streaming_snapshot(context), context.mode == :stream)
     |> maybe_put(:request_payload, context.request_payload, include_payloads?(context))
     |> maybe_put(:response_payload, extra[:response_payload], include_payloads?(context))
     |> maybe_put(:error, extra[:error], not is_nil(extra[:error]))
   end
+
+  defp streaming_snapshot(%{
+         mode: :stream,
+         started_at: started_at,
+         first_chunk_at: first_chunk_at
+       })
+       when is_integer(started_at) and is_integer(first_chunk_at) do
+    %{
+      first_chunk_at: first_chunk_at,
+      time_to_first_chunk: first_chunk_at - started_at
+    }
+  end
+
+  defp streaming_snapshot(%{mode: :stream, first_chunk_at: first_chunk_at}) do
+    %{first_chunk_at: first_chunk_at, time_to_first_chunk: nil}
+  end
+
+  defp streaming_snapshot(_context), do: nil
 
   @doc """
   Returns the normalized metadata map for reasoning lifecycle events.
@@ -435,40 +548,32 @@ defmodule ReqLLM.Telemetry do
   end
 
   defp payload_mode(opts) do
-    global_payload_mode =
-      Application.get_env(:req_llm, :telemetry, [])
-      |> normalize_telemetry_opts()
-      |> Map.get(:payloads, :none)
-
     case Keyword.fetch(opts, :telemetry) do
-      {:ok, telemetry_opts} ->
-        telemetry_opts
-        |> normalize_telemetry_opts()
-        |> Map.get(:payloads, :none)
+      {:ok, value} ->
+        Map.get(parse_telemetry_opt(value), :payloads, :none)
 
       :error ->
-        global_payload_mode
+        :req_llm
+        |> Application.get_env(:telemetry, [])
+        |> parse_telemetry_opt()
+        |> Map.get(:payloads, :none)
     end
   end
 
-  defp normalize_telemetry_opts(opts) when is_list(opts) do
-    opts
-    |> Enum.into(%{})
-    |> normalize_telemetry_opts()
+  defp parse_telemetry_opt(opts) when is_list(opts), do: parse_telemetry_opt(Map.new(opts))
+
+  defp parse_telemetry_opt(opts) when is_map(opts) do
+    %{
+      payloads: parse_payload_mode(Map.get(opts, :payloads, Map.get(opts, "payloads"))),
+      conversation_id: Map.get(opts, :conversation_id, Map.get(opts, "conversation_id"))
+    }
   end
 
-  defp normalize_telemetry_opts(opts) when is_map(opts) do
-    payloads =
-      case Map.get(opts, :payloads, Map.get(opts, "payloads", :none)) do
-        :raw -> :raw
-        "raw" -> :raw
-        _ -> :none
-      end
+  defp parse_telemetry_opt(_), do: %{payloads: :none, conversation_id: nil}
 
-    %{payloads: payloads}
-  end
-
-  defp normalize_telemetry_opts(_), do: %{payloads: :none}
+  defp parse_payload_mode(:raw), do: :raw
+  defp parse_payload_mode("raw"), do: :raw
+  defp parse_payload_mode(_), do: :none
 
   defp request_input(:embedding, opts) do
     opts[:text]
@@ -500,6 +605,29 @@ defmodule ReqLLM.Telemetry do
 
   defp request_input(_operation, opts) do
     opts[:context] || opts[:messages] || opts[:text]
+  end
+
+  defp extract_server(source), do: ReqLLM.Telemetry.RequestSource.server(source)
+
+  defp merge_server(context, %{} = new) when map_size(new) > 0 do
+    Map.put(context, :server, new)
+  end
+
+  defp merge_server(context, _empty) do
+    Map.put_new(context, :server, %{})
+  end
+
+  @doc """
+  Pre-populates `context.server` from a request source that `start_request`
+  cannot read directly (e.g. an HTTPContext for streaming flows). Has no
+  effect if the source yields no server info.
+  """
+  @spec put_server_from_source(context(), any()) :: context()
+  def put_server_from_source(context, source) do
+    case extract_server(source) do
+      server when map_size(server) > 0 -> Map.put(context, :server, server)
+      _ -> context
+    end
   end
 
   defp summarize_request(operation, %Context{} = context)

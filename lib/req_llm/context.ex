@@ -134,17 +134,19 @@ defmodule ReqLLM.Context do
     validate? = Keyword.get(opts, :validate, true)
     system_prompt = Keyword.get(opts, :system_prompt)
     convert_loose? = Keyword.get(opts, :convert_loose, true)
+    opts_tools = Keyword.get(opts, :tools)
 
     with {:ok, ctx0} <- to_context(prompt, convert_loose?) do
       ctx1 = maybe_add_system(ctx0, system_prompt)
+      ctx2 = %{ctx1 | tools: persist_tools(ctx1.tools, opts_tools)}
 
       if validate? do
-        case validate(ctx1) do
-          {:ok, ctx1} -> {:ok, ctx1}
+        case validate(ctx2) do
+          {:ok, ctx2} -> {:ok, ctx2}
           {:error, _} = error -> error
         end
       else
-        {:ok, ctx1}
+        {:ok, ctx2}
       end
     end
   end
@@ -1209,9 +1211,7 @@ defmodule ReqLLM.Context do
   defp decode_file_data("data:" <> _ = data_uri, media_type) do
     case Regex.run(~r/^data:([^;,]*)(?:;[^,]*)*;base64,(.*)$/s, data_uri) do
       [_, uri_media_type, encoded] ->
-        decoded = String.replace(encoded, ~r/\s+/, "")
-
-        case Base.decode64(decoded) do
+        case Base.decode64(encoded, ignore: :whitespace) do
           {:ok, data} -> {:ok, data, file_data_media_type(uri_media_type, media_type)}
           :error -> :error
         end

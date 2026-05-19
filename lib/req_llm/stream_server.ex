@@ -81,6 +81,9 @@ defmodule ReqLLM.StreamServer do
     :protocol_state,
     :provider_state,
     :telemetry,
+    :pending_http_exit,
+    pending_http_events: [],
+    telemetry_pending?: false,
     queue: :queue.new(),
     status: :init,
     consumer_refs: MapSet.new(),
@@ -100,7 +103,8 @@ defmodule ReqLLM.StreamServer do
     fixture_saved?: false,
     raw_iodata: [],
     raw_bytes: 0,
-    terminated?: false
+    terminated?: false,
+    message_acc: %ReqLLM.Provider.ChunkAccumulator{}
   ]
 
   @doc """
@@ -374,6 +378,11 @@ defmodule ReqLLM.StreamServer do
   end
 
   @impl GenServer
+  def handle_call({:http_event, event}, _from, %{telemetry_pending?: true} = state) do
+    {:reply, :ok, %{state | pending_http_events: state.pending_http_events ++ [event]}}
+  end
+
+  @impl GenServer
   def handle_call({:http_event, event}, _from, state) do
     {:reply, reply, new_state} = process_http_event(event, state)
 
@@ -422,13 +431,23 @@ defmodule ReqLLM.StreamServer do
 
   @impl GenServer
   def handle_call({:start_http, provider_mod, model, context, opts, finch_name}, _from, state) do
+    defer_events? = Keyword.get(opts, :defer_http_events_until_telemetry?, false)
+    streamer_opts = Keyword.delete(opts, :defer_http_events_until_telemetry?)
+
     streamer_mod =
-      case Keyword.get(opts, :stream_transport) do
+      case Keyword.get(streamer_opts, :stream_transport) do
         :websocket -> ReqLLM.Streaming.WebSocketClient
         _ -> ReqLLM.Streaming.FinchClient
       end
 
-    case streamer_mod.start_stream(provider_mod, model, context, opts, self(), finch_name) do
+    case streamer_mod.start_stream(
+           provider_mod,
+           model,
+           context,
+           streamer_opts,
+           self(),
+           finch_name
+         ) do
       {:ok, task_pid, http_context, canonical_json} ->
         Process.monitor(task_pid)
 
@@ -446,7 +465,9 @@ defmodule ReqLLM.StreamServer do
             http_context: http_context,
             canonical_json: canonical_json,
             object_json_mode?: json_mode?,
-            object_acc: []
+            object_acc: [],
+            pending_http_events: [],
+            telemetry_pending?: defer_events?
         }
 
         {:reply, {:ok, task_pid, http_context, canonical_json}, new_state}
@@ -484,7 +505,15 @@ defmodule ReqLLM.StreamServer do
 
   @impl GenServer
   def handle_call({:set_telemetry_context, telemetry_context}, _from, state) do
-    {:reply, :ok, %{state | telemetry: telemetry_context}}
+    new_state =
+      state
+      |> Map.put(:telemetry, telemetry_context)
+      |> drain_pending_http_events()
+
+    case finalize_lifecycle(new_state) do
+      {:stop, final_state} -> {:stop, :normal, :ok, final_state}
+      {:continue, final_state} -> {:reply, :ok, final_state}
+    end
   end
 
   @impl GenServer
@@ -523,25 +552,13 @@ defmodule ReqLLM.StreamServer do
   end
 
   @impl GenServer
+  def handle_info({:EXIT, pid, reason}, %{http_task: pid, telemetry_pending?: true} = state) do
+    {:noreply, store_pending_http_exit(state, reason)}
+  end
+
+  @impl GenServer
   def handle_info({:EXIT, pid, reason}, %{http_task: pid} = state) do
-    new_state =
-      case reason do
-        :normal ->
-          finalize_stream_with_fixture(state)
-
-        :shutdown ->
-          finalize_stream_with_fixture(state)
-
-        {:shutdown, _} ->
-          finalize_stream_with_fixture(state)
-
-        _ ->
-          state
-          |> Map.put(:status, {:error, {:http_task_failed, reason}})
-          |> maybe_emit_stream_exception({:http_task_failed, reason})
-      end
-
-    new_state = reply_to_waiting_callers(new_state)
+    new_state = state |> process_http_task_exit(reason) |> reply_to_waiting_callers()
 
     case finalize_lifecycle(new_state) do
       {:stop, final_state} -> {:stop, :normal, final_state}
@@ -555,19 +572,16 @@ defmodule ReqLLM.StreamServer do
   end
 
   @impl GenServer
+  def handle_info(
+        {:DOWN, _ref, :process, pid, reason},
+        %{http_task: pid, telemetry_pending?: true} = state
+      ) do
+    {:noreply, store_pending_http_exit(state, reason)}
+  end
+
+  @impl GenServer
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{http_task: pid} = state) do
-    new_state =
-      case reason do
-        :normal ->
-          finalize_stream_with_fixture(state)
-
-        _ ->
-          state
-          |> Map.put(:status, {:error, {:http_task_failed, reason}})
-          |> maybe_emit_stream_exception({:http_task_failed, reason})
-      end
-
-    new_state = reply_to_waiting_callers(new_state)
+    new_state = state |> process_http_task_exit(reason) |> reply_to_waiting_callers()
 
     case finalize_lifecycle(new_state) do
       {:stop, final_state} -> {:stop, :normal, final_state}
@@ -655,6 +669,54 @@ defmodule ReqLLM.StreamServer do
       |> reply_to_waiting_callers()
 
     {:reply, :ok, new_state}
+  end
+
+  defp drain_pending_http_events(%{pending_http_events: []} = state) do
+    state
+    |> Map.put(:telemetry_pending?, false)
+    |> drain_pending_http_exit()
+  end
+
+  defp drain_pending_http_events(state) do
+    pending_events = state.pending_http_events
+    state = %{state | telemetry_pending?: false, pending_http_events: []}
+
+    Enum.reduce(pending_events, state, fn event, acc ->
+      {:reply, _reply, new_acc} = process_http_event(event, acc)
+      new_acc
+    end)
+    |> drain_pending_http_exit()
+  end
+
+  defp drain_pending_http_exit(%{pending_http_exit: nil} = state), do: state
+
+  defp drain_pending_http_exit(state) do
+    state
+    |> Map.put(:pending_http_exit, nil)
+    |> process_http_task_exit(state.pending_http_exit)
+    |> reply_to_waiting_callers()
+  end
+
+  defp store_pending_http_exit(%{pending_http_exit: nil} = state, reason) do
+    %{state | pending_http_exit: reason}
+  end
+
+  defp store_pending_http_exit(state, _reason), do: state
+
+  defp process_http_task_exit(%{status: :done} = state, _reason), do: state
+
+  defp process_http_task_exit(state, reason) when reason in [:normal, :shutdown] do
+    finalize_stream_with_fixture(state)
+  end
+
+  defp process_http_task_exit(state, {:shutdown, _}) do
+    finalize_stream_with_fixture(state)
+  end
+
+  defp process_http_task_exit(state, reason) do
+    state
+    |> Map.put(:status, {:error, {:http_task_failed, reason}})
+    |> maybe_emit_stream_exception({:http_task_failed, reason})
   end
 
   defp parse_protocol_events(chunk, state) do
@@ -764,11 +826,11 @@ defmodule ReqLLM.StreamServer do
   defp terminal_chunk?(_chunk), do: false
 
   defp enqueue_chunks(chunks, state) do
-    {new_queue, updated_metadata, new_obj_acc, telemetry} =
+    {new_queue, updated_metadata, new_obj_acc, telemetry, message_acc} =
       Enum.reduce(
         chunks,
-        {state.queue, state.metadata, state.object_acc, state.telemetry},
-        fn chunk, {queue, metadata, obj_acc, telemetry} ->
+        {state.queue, state.metadata, state.object_acc, state.telemetry, state.message_acc},
+        fn chunk, {queue, metadata, obj_acc, telemetry, msg_acc} ->
           new_queue = :queue.in(chunk, queue)
 
           updated_metadata =
@@ -776,7 +838,6 @@ defmodule ReqLLM.StreamServer do
               :meta ->
                 chunk_meta = chunk.metadata || %{}
 
-                # Extract usage for normalization
                 usage = Map.get(chunk_meta, :usage)
 
                 meta_with_usage =
@@ -790,7 +851,6 @@ defmodule ReqLLM.StreamServer do
                     metadata
                   end
 
-                # Merge remaining metadata (like finish_reason)
                 Map.merge(meta_with_usage, Map.drop(chunk_meta, [:usage, "usage"]))
 
               _ ->
@@ -804,13 +864,15 @@ defmodule ReqLLM.StreamServer do
               obj_acc
             end
 
+          msg_acc = ReqLLM.Provider.ChunkAccumulator.push(msg_acc, chunk)
+
           telemetry =
             case telemetry do
               nil -> nil
               context -> ReqLLM.Telemetry.observe_stream_chunk(context, chunk)
             end
 
-          {new_queue, updated_metadata, obj_acc, telemetry}
+          {new_queue, updated_metadata, obj_acc, telemetry, msg_acc}
         end
       )
 
@@ -819,8 +881,22 @@ defmodule ReqLLM.StreamServer do
       | queue: new_queue,
         metadata: updated_metadata,
         object_acc: new_obj_acc,
-        telemetry: telemetry
+        telemetry: telemetry,
+        message_acc: message_acc
     }
+  end
+
+  # Synthesizes a partial assistant `%Message{}` from the accumulated stream
+  # chunks for OTel content capture (`gen_ai.output.messages`). The canonical
+  # response message — with reasoning_details, provider metadata, and object
+  # extraction — is still built by `ReqLLM.Provider.Defaults.ResponseBuilder`
+  # from the full chunk list. Reasoning is intentionally `nil` here because
+  # OTel content capture redacts reasoning text anyway.
+  defp finalize_message_metadata(state) do
+    case ReqLLM.Provider.ChunkAccumulator.finalize_message(state.message_acc) do
+      nil -> state
+      message -> %{state | metadata: Map.put(state.metadata, :message, message)}
+    end
   end
 
   defp dequeue_chunk(state) do
@@ -1165,7 +1241,11 @@ defmodule ReqLLM.StreamServer do
 
   defp maybe_emit_stream_stop(%{telemetry: nil} = state, _finish_reason), do: state
 
+  # Partial assistant messages are attached on stream stop only — not on
+  # exception. This matches the OTel GenAI spec: errors do not populate
+  # `gen_ai.output.messages` because the response is not well-formed.
   defp maybe_emit_stream_stop(%{telemetry: telemetry} = state, finish_reason) do
+    state = finalize_message_metadata(state)
     usage = state.metadata[:usage]
 
     telemetry =

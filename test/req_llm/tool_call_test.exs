@@ -28,6 +28,45 @@ defmodule ReqLLM.ToolCallTest do
     end
   end
 
+  describe "new_builtin/3 and builtin?/1" do
+    test "creates builtin tool calls and detects them" do
+      tool_call = ToolCall.new_builtin("ws_1", "web_search_call", ~s({"query":"elixir"}))
+
+      assert tool_call.id == "ws_1"
+      assert tool_call.function.name == "web_search_call"
+      assert tool_call.function.arguments == ~s({"query":"elixir"})
+      assert ToolCall.builtin?(tool_call)
+    end
+
+    test "detects builtin flags in maps" do
+      assert ToolCall.builtin?(%{builtin?: true})
+      assert ToolCall.builtin?(%{"builtin?" => true})
+      assert ToolCall.builtin?(%{function: %{builtin?: true}})
+      assert ToolCall.builtin?(%{"function" => %{"builtin?" => true}})
+      refute ToolCall.builtin?(%{function: %{name: "get_weather"}})
+    end
+  end
+
+  describe "flagged_builtin?/1" do
+    test "checks the flag on the given map without unwrapping :function" do
+      assert ToolCall.flagged_builtin?(%{builtin?: true})
+      assert ToolCall.flagged_builtin?(%{"builtin?" => true})
+      refute ToolCall.flagged_builtin?(%{function: %{builtin?: true}})
+      refute ToolCall.flagged_builtin?(%{builtin?: false})
+      refute ToolCall.flagged_builtin?(%{})
+      refute ToolCall.flagged_builtin?(nil)
+    end
+  end
+
+  describe "builtin_flag?/1 (deprecated alias)" do
+    test "delegates to flagged_builtin?/1" do
+      assert ToolCall.builtin_flag?(%{builtin?: true}) ==
+               ToolCall.flagged_builtin?(%{builtin?: true})
+
+      refute ToolCall.builtin_flag?(%{function: %{builtin?: true}})
+    end
+  end
+
   describe "name/1" do
     test "extracts function name from ToolCall" do
       tool_call = ToolCall.new("call_123", "get_weather", "{}")
@@ -216,6 +255,15 @@ defmodule ReqLLM.ToolCallTest do
       assert decoded["type"] == "function"
       assert decoded["function"]["name"] == "get_time"
       assert decoded["function"]["arguments"] == ~s({"timezone":"UTC"})
+      refute Map.has_key?(decoded["function"], "builtin?")
+    end
+
+    test "preserves builtin marker when encoding" do
+      tool_call = ToolCall.new_builtin("ws_1", "web_search_call", ~s({"query":"elixir"}))
+      decoded = tool_call |> Jason.encode!() |> Jason.decode!()
+
+      assert decoded["function"]["builtin?"] == true
+      assert ToolCall.builtin?(decoded)
     end
   end
 

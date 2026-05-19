@@ -125,6 +125,7 @@ defmodule ReqLLM.Streaming do
               canonical_json
             )
         )
+        |> ReqLLM.Telemetry.put_server_from_source(http_context)
         |> ReqLLM.Telemetry.start_request(canonical_json)
 
       :ok = StreamServer.set_telemetry_context(server_pid, stream_context)
@@ -205,7 +206,9 @@ defmodule ReqLLM.Streaming do
            provider_mod,
            model,
            context,
-           Keyword.put(opts, :stream_transport, :websocket),
+           opts
+           |> Keyword.put(:stream_transport, :websocket)
+           |> Keyword.put(:defer_http_events_until_telemetry?, true),
            ReqLLM.Finch
          ) do
       {:ok, task_pid, http_context, canonical_json} ->
@@ -230,7 +233,7 @@ defmodule ReqLLM.Streaming do
            provider_mod,
            model,
            context,
-           opts,
+           Keyword.put(opts, :defer_http_events_until_telemetry?, true),
            finch_name
          ) do
       {:ok, task_pid, http_context, canonical_json} ->

@@ -72,6 +72,7 @@ defmodule ReqLLM.StreamResponse do
   alias ReqLLM.Response
   alias ReqLLM.Response.Stream, as: ResponseStream
   alias ReqLLM.StreamResponse.MetadataHandle
+  alias ReqLLM.ToolCall
 
   @schema Zoi.struct(__MODULE__, %{
             stream: Zoi.any() |> Zoi.required(),
@@ -295,9 +296,11 @@ defmodule ReqLLM.StreamResponse do
   def classify(%__MODULE__{stream: stream}) do
     summary = ResponseStream.summarize(stream)
 
+    actionable_tool_calls = Enum.reject(summary.tool_calls, &ToolCall.flagged_builtin?/1)
+
     type =
       cond do
-        summary.tool_calls != [] -> :tool_calls
+        actionable_tool_calls != [] -> :tool_calls
         summary.finish_reason == :tool_calls -> :tool_calls
         true -> :final_answer
       end
