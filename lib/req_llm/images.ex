@@ -57,6 +57,26 @@ defmodule ReqLLM.Images do
                    type: :string,
                    doc: "Negative prompt text (provider dependent)"
                  ],
+                 source_image: [
+                   type: {:custom, __MODULE__, :validate_binary, []},
+                   doc:
+                     "Source image bytes for image editing or reference generation (OpenAI image models only)"
+                 ],
+                 source_image_media_type: [
+                   type: :string,
+                   doc:
+                     "MIME type for source_image, defaults to image/png when source_image is set (OpenAI image models only)"
+                 ],
+                 mask: [
+                   type: {:custom, __MODULE__, :validate_binary, []},
+                   doc:
+                     "Optional mask image bytes for inpainting/editing (OpenAI image models only)"
+                 ],
+                 mask_media_type: [
+                   type: :string,
+                   doc:
+                     "MIME type for mask, defaults to image/png when mask is set (OpenAI image models only)"
+                 ],
                  user: [
                    type: :string,
                    doc: "User identifier for tracking and abuse detection"
@@ -102,6 +122,10 @@ defmodule ReqLLM.Images do
   """
   @spec schema :: NimbleOptions.t()
   def schema, do: @base_schema
+
+  @doc false
+  def validate_binary(value) when is_binary(value), do: {:ok, value}
+  def validate_binary(_value), do: {:error, "expected binary"}
 
   @doc """
   Generates images using an AI model with full response metadata.
